@@ -1,0 +1,3 @@
+{
+	"command":"cat {input} | /app/bin/httpx -json -o {output}"
+}

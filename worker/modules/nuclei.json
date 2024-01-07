@@ -1,0 +1,3 @@
+{
+	"command":"/app/bin/nuclei -l {input} -t /app/artifacts/templates -stats -s info -o {output}"
+}

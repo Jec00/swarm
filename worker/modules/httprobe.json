@@ -1,0 +1,3 @@
+{
+	"command":"cat {input} | /app/bin/httprobe -c 60 > {output}"
+}

@@ -1,0 +1,373 @@
+#!/usr/bin/env python3
+
+import argparse
+import os
+import requests
+import statistics
+import time
+import sys
+from datetime import datetime, timedelta
+import json
+from prettytable import PrettyTable
+
+class JobClient:
+    def __init__(self, server_url, api_key):
+        self.server_url = server_url
+        self.api_key = api_key
+
+    def start_scan(self, file, module, chunk_index, batch_size, scan_id=None):
+        headers = {'Authorization': f'Bearer {self.api_key}'}
+        with open(file, 'r') as file:
+            file_content = file.readlines()
+
+        data = {
+            'module': module,
+            'file_content': file_content,
+            'batch_size': int(batch_size),
+            'scan_id': scan_id,
+            'chunk_index': chunk_index
+        }
+
+        response = requests.post(f'{self.server_url}/queue', headers=headers, json=data)
+        return response.status_code, response.text
+
+    def get_statuses(self):
+        headers = {'Authorization': f'Bearer {self.api_key}'}
+        response = requests.get(f'{self.server_url}/get-statuses', headers=headers)
+        return response.json() if response.status_code == 200 else None
+
+    def fetch_raw_data(self, scan_id):
+        headers = {'Authorization': f'Bearer {self.api_key}'}
+        url = f'{self.server_url}/raw/{scan_id}'
+    
+        response = requests.get(url, headers=headers)
+    
+        if response.status_code == 200:
+            return response.text
+        else:
+            return f'Error: {response.status_code} - {response.text}'
+
+    def get_latest_chunk_raw(self):
+        headers = {'Authorization': f'Bearer {self.api_key}'}
+        url = f'{self.server_url}/get-latest-chunk'
+
+        response = requests.get(url, headers=headers)
+
+        if response.status_code == 200:
+            job_id = response.text
+            split = job_id.split('_')
+
+            scan_id = split[0] + "_" + split[1]
+            chunk_id = split[2]
+
+            url = f'{self.server_url}/get-chunk/{scan_id}/{chunk_id}'        
+            response2 = requests.get(url, headers=headers)
+
+            if response2.status_code == 200:
+                return response2.json()['contents'].strip()
+            return None
+        else:
+            return None
+
+    def tail(self, timeout=36000):
+        calls_without_data = 0
+        while calls_without_data <= timeout:
+            latest_chunk = self.get_latest_chunk_raw()
+
+            if latest_chunk != None:
+                sys.stdout.write(latest_chunk+"\n")
+                sys.stdout.flush()
+            else:
+                calls_without_data +=1 
+                time.sleep(0.05)
+
+def parse_config():
+    config = {}
+    config_file = os.path.expanduser('~/.axiom.json')
+    if os.path.exists(config_file):
+        with open(config_file, 'r') as config_file:
+            config = json.load(config_file)
+    return config
+
+config = parse_config()
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Swarm Scan Client')
+    parser.add_argument('action', nargs="?", choices=['scan', 'workers', 'scans', 'jobs', 'spinup', 'terminate', 'cat', 'stream', 'recycle', 'reset'], help='action to perform')
+    parser.add_argument('--server-url', default=config.get('server_url'), help='Server URL')
+    parser.add_argument('--api-key', default=config.get('api_key'), help='API Key')
+    parser.add_argument('--configure' , help='Configure the server URL and API key and store to ~/.axiom.conf', action='store_true')
+    parser.add_argument('--file', help='Path to the file (for scan fleet)')
+    parser.add_argument('--module', help='Type of scan (for scan fleet)')
+    parser.add_argument('--batch-size', default="auto", help='Batch size for the scan (for scan fleet)')
+    parser.add_argument('--prefix', help='Prefix for droplet names (for spinup and terminate fleets)')
+    parser.add_argument('--nodes', type=int, help='Number of droplets to spin up (for spinup fleet)')
+    parser.add_argument('--scan-id', help='Scan ID (for queue_s3_chunk fleet)')
+    parser.add_argument('--autoscale', help='Enable autoscaling (for spinup fleet)', action='store_true')
+    parser.add_argument('--tail', help='tail the output')
+
+
+    args = parser.parse_args()
+    client = JobClient(args.server_url, args.api_key)
+
+    if args.server_url is None and config.get('server_url') is None:
+        print('Server URL is required')
+        exit(1)
+        return
+
+    if args.api_key is None and config.get('api_key') is None:
+        print('API Key is required')
+        exit(1)
+        return
+
+
+    if args.action == 'scan':
+        if args.file is None or args.module is None:
+            print('Both file and module are required for starting a scan')
+            return
+    
+        if args.autoscale:
+            data = {
+                'prefix': args.prefix,
+                'nodes': args.nodes
+            }
+            total_workers = int(args.nodes)
+            headers = {'Authorization': f'Bearer {args.api_key}'}
+            response = requests.post(f'{args.server_url}/spin-up', headers=headers, json=data)
+            print(response.status_code, response.text)
+
+        batch_size = 1
+        if args.batch_size != 'auto':
+            batch_size = args.batch_size
+        else:
+            # Get the number of lines in the file
+            with open(args.file, 'r') as file:
+                file_content = file.readlines()
+            total_workers = total_workers * 1.8
+            batch_size = len(file_content) / total_workers
+            if batch_size < 1:
+                batch_size = 1
+
+        status_code, response = client.start_scan(args.file, args.module, 0, batch_size, scan_id=None)
+        print(f'Start Scan Status Code: {status_code}')
+        print(f'Start Scan Response: {response}')
+
+    elif args.action == 'workers' or args.action == 'scans' or args.action == 'jobs':
+        status_summary = client.get_statuses()
+        if status_summary:
+            workers = status_summary['workers']
+            jobs = status_summary['jobs']
+            scans = status_summary['scans']  # Add this line
+
+            # Display worker statuses
+            print("Worker Statuses:") if args.action == 'workers' else None
+            worker_table = PrettyTable()
+            worker_table.field_names = ['Worker ID', 'Last Contacted', 'Polls with No Jobs', 'Status']
+            for worker_id, worker_data in workers.items():
+                last_contacted = worker_data.get('last_contact')
+                polls_with_no_jobs = worker_data.get('polls_with_no_jobs')
+                status = worker_data.get('status')
+                worker_table.add_row([worker_id, last_contacted, polls_with_no_jobs, status])
+            print(worker_table) if args.action == 'workers' else None
+            
+            durations = []
+            # Display job statuses
+
+            print("\nJob Statuses:") if args.action  == 'jobs' else None
+            job_table = PrettyTable()
+            job_table.field_names = ['Job ID', 'Scan ID', 'Chunk Index', 'Status', 'Worker ID', 'Started At', 'Completed At', 'Seconds']
+            sorted_jobs = sorted(jobs.items(), key=lambda item: int(item[1]['chunk_index']))
+            for job_id, job_data in sorted_jobs:
+                scan_id = job_data.get('scan_id')
+                chunk_index = job_data.get('chunk_index')
+                status = job_data.get('status')
+                worker_id = job_data.get('worker_id')
+                started_at = job_data.get('started_at')
+                completed_at = job_data.get('completed_at')
+                duration_str = ""
+                if started_at and completed_at:
+                    duration = completed_at - started_at
+                    duration_str = str(duration)
+
+                    durations.append(duration)
+
+                job_table.add_row([job_id, scan_id, chunk_index, status, worker_id, started_at, completed_at, duration_str]) 
+            print(job_table) if args.action == 'jobs' else None
+
+            # Display scan information
+            print("\nScan Information:") if args.action  == 'scans' else None
+            scan_table = PrettyTable()
+            scan_table.field_names = ['Scan ID', 'Total Chunks', 'Chunks Complete', '%', 'Workers', 'Module', 'Started', 'Completed', 'Avg Seconds', 'ECT']
+            workers = status_summary['workers']
+
+            for scan_data in scans:
+                scan_id = scan_data['scan_id']
+                total_chunks = scan_data['total_chunks']
+                chunks_complete = scan_data['chunks_complete']
+                percent_complete = scan_data['percent_complete']
+
+                # Get the list of workers that have completed the scan
+                workers_list = []
+                for worker_id, worker_data in workers.items():
+                    workers_list.append(worker_id)
+                
+                module = scan_data['module']
+                scan_started = time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(scan_data['scan_started']))
+                scan_completed = time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(scan_data['completed_at']))
+                if len(durations) > 0:
+                    average_duration = sum(durations) / len(durations)
+                else:
+                    average_duration = 0
+
+                
+                # Function to estimate completion time based on percentage
+                def estimate_completion_time(scan_started, total_chunks, chunks_complete):
+                    if chunks_complete == 0:
+                        return None  # No progress made yet
+                
+                    current_time = time.time()
+                    elapsed_time = current_time - scan_started
+                    completion_percentage = chunks_complete / total_chunks
+                    remaining_percentage = 1 - completion_percentage
+                
+                    if elapsed_time == 0:
+                        return None  # Avoid division by zero
+                
+                    # Estimate time for remaining percentage based on elapsed time
+                    estimated_remaining_time = remaining_percentage * (elapsed_time / completion_percentage)
+                
+                    # Calculate estimated completion time
+                    estimated_completion_time = current_time + estimated_remaining_time
+
+                    if completion_percentage == 1:
+                        estimated_completion_time = scan_data['completed_at']
+                
+                    return time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(estimated_completion_time))
+                
+                # Example usage
+                estimated_time = estimate_completion_time(scan_data['scan_started'], total_chunks, chunks_complete)
+                
+                if estimated_time is not None:
+                    print(f"Estimated completion time: {estimated_time}")
+                else:
+                    print("Insufficient progress to make an estimate.")
+                
+                
+
+                scan_table.add_row([scan_id, total_chunks, chunks_complete, percent_complete, len(workers_list), module, scan_started, scan_completed, average_duration, estimated_time])
+
+            print(scan_table) if args.action == 'scans' else None
+        else:
+            print("Failed to retrieve statuses")
+    elif args.action == 'spinup':
+        if args.prefix is None or args.nodes is None:
+            print('Both prefix and nodes are required for spinning up droplets')
+            return
+
+        data = {
+            'prefix': args.prefix,
+            'nodes': args.nodes
+        }
+        headers = {'Authorization': f'Bearer {args.api_key}'}
+        response = requests.post(f'{args.server_url}/spin-up', headers=headers, json=data)
+        #print(response.status_code, response.text)
+        if response.status_code == 202:
+            print('Successfully issued spinup for prefix ' + args.prefix)
+
+    elif args.action == 'terminate':
+        if args.prefix is None:
+            print('Prefix is required for spinning down droplets')
+            return
+
+        data = {
+            'prefix': args.prefix
+        }
+        headers = {'Authorization': f'Bearer {args.api_key}'}
+        response = requests.post(f'{args.server_url}/spin-down', headers=headers, json=data)
+        print(response.status_code, response.text)
+    elif args.action == 'recycle':
+        if args.prefix is None:
+            print('Prefix is required for spinning down droplets')
+            return
+
+        data = {
+            'prefix': args.prefix
+        }
+        headers = {'Authorization': f'Bearer {args.api_key}'}
+        response = requests.post(f'{args.server_url}/spin-down', headers=headers, json=data)
+        print(response.status_code, response.text)
+
+        print('Waiting 10 seconds to spin fleet back up')
+        time.sleep(10)
+
+
+        if args.prefix is None or args.nodes is None:
+            print('Both prefix and nodes are required for spinning up droplets')
+            return
+
+        data = {
+            'prefix': args.prefix,
+            'nodes': args.nodes
+        }
+        headers = {'Authorization': f'Bearer {args.api_key}'}
+        response = requests.post(f'{args.server_url}/spin-up', headers=headers, json=data)
+        print(response.status_code, response.text)
+    elif args.action == 'stream':
+        chunk = []
+        chunk_index = 0
+        for line in sys.stdin:
+            chunk.append(line)
+
+            if len(chunk) >= 10:
+                chunk_index += 1
+                job_id = f'{args.scan_id}_{chunk_index}'
+                tmp_filename = f'tmp/{job_id}.txt'
+                with open(tmp_filename, 'w') as f:
+                    f.writelines(chunk)
+                print(f'Uploading chunk {chunk_index}')
+
+                status_code, response = client.start_scan(tmp_filename, args.module, chunk_index, args.batch_size, args.scan_id)
+                time.sleep(0.3)
+                print(status_code, response)
+
+                chunk = []
+            
+
+    elif args.action == 'cat':
+        print(client.fetch_raw_data(args.scan_id))
+
+    elif args.action == 'reset':
+        headers = {
+                'Authorization':f'Bearer {args.api_key}'
+        }
+
+        response = requests.post(f'{args.server_url}/reset', headers=headers)
+        print(response.status_code, response.text)
+
+    if args.configure:
+        data = {}
+        if args.api_key:
+            data['api_key'] = args.api_key
+        else:
+            data['api_key'] = input('API Key: ')
+
+        if args.server_url:
+            data['server_url'] = args.server_url
+        else:
+            data['server_url'] = input('Server URL: ')
+
+        home_directory = os.path.expanduser('~')
+        config_file = os.path.join(home_directory, '.axiom.json')
+        with open(config_file, 'w') as f:
+            # pretty dump
+            json.dump(data, f, indent=4)
+
+        print(f'Configuration saved to {config_file}')
+
+    if args.tail:
+        client.tail()
+
+
+if __name__ == '__main__':
+    main()
